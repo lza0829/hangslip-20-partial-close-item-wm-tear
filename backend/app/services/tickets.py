@@ -1,11 +1,10 @@
 from __future__ import annotations
-from app.services import partial_surface
 
 from datetime import datetime
 
 from fastapi import HTTPException
 
-from app.db import FORWARD, connect, transaction
+from app.db import FORWARD, IN_FLIGHT_STATUSES, connect, transaction
 from app.services.gate import ensure_day_row, is_day_sealed, refresh_in_flight, today_str
 
 # ---------------------------------------------------------------------------
@@ -446,10 +445,17 @@ def quarantine(ticket_no: str, kind: str, reason: str, operator: str = "店员")
 
 
 def audit_quantity() -> dict:
-    """件数守恒重放：pickup_lines 汇总必须等于 ticket_items.picked_qty。"""
+    """件位—票态—水位—残留区四方对账。
+
+    全局口径「票籍听件」要求所有投影都能由勾选位图重放：
+      1. 件数守恒：pickup_lines 汇总 == ticket_items.picked_qty，且不越上界；
+      2. 票态可重放：已取 ⟺ 残留为 0；部分已取 ⟺ 0<已取<在册；待取 ⟺ 一件未取；
+      3. 水位可重放：水位表缓存 == 在途票态计数；
+      4. 残留区可核：凡残留>0 的件，其票不得是已取关票态。
+    """
     conn = connect()
     try:
-        rows = conn.execute(
+        item_rows = conn.execute(
             """
             SELECT i.id AS item_id, i.ticket_no, i.qty, i.picked_qty,
                    COALESCE(SUM(l.qty), 0) AS replayed
@@ -460,23 +466,77 @@ def audit_quantity() -> dict:
             """
         ).fetchall()
         mismatches = []
-        for r in rows:
+        for r in item_rows:
             d = dict(r)
             if d["replayed"] != d["picked_qty"] or not (0 <= d["picked_qty"] <= d["qty"]):
+                d["不符类型"] = "件数守恒"
                 mismatches.append(d)
+
+        # 票态由件位重放。
+        ticket_rows = conn.execute(
+            """
+            SELECT t.ticket_no, t.status,
+                   COALESCE(SUM(i.qty), 0) AS total_qty,
+                   COALESCE(SUM(i.picked_qty), 0) AS picked_qty,
+                   COALESCE(SUM(i.qty - i.picked_qty), 0) AS remaining_qty
+              FROM hang_tickets t
+              LEFT JOIN ticket_items i ON i.ticket_no = t.ticket_no
+             GROUP BY t.ticket_no
+            """
+        ).fetchall()
+        status_mismatches = []
+        residual_mismatches = []
+        # 票态投影只在取衣三态上重放：待取/部分已取/已取由件位唯一决定；
+        # 工序轨（已收…熨烫）与隔离态不由件位推导，不纳入此项核对。
+        projected = ("待取", PARTIAL, "已取")
+        for r in ticket_rows:
+            d = dict(r)
+            status, total, picked, remaining = (
+                d["status"], d["total_qty"], d["picked_qty"], d["remaining_qty"],
+            )
+            if status not in projected:
+                continue
+            if total > 0 and remaining == 0:
+                expected = "已取"
+            elif picked > 0:
+                expected = PARTIAL
+            else:
+                expected = "待取"
+            if expected != status:
+                d["应态"] = expected
+                d["不符类型"] = "票态投影"
+                status_mismatches.append(d)
+            # 关票态下不得残留未取件（假分取收口的红线）。
+            if status == "已取" and remaining > 0:
+                d["不符类型"] = "关票残留"
+                residual_mismatches.append(d)
+
+        # 水位由在途票态重放。
+        placeholders = ",".join("?" for _ in IN_FLIGHT_STATUSES)
+        in_flight = conn.execute(
+            f"SELECT COUNT(*) AS c FROM hang_tickets WHERE status IN ({placeholders})",
+            IN_FLIGHT_STATUSES,
+        ).fetchone()["c"]
+        wm_row = conn.execute(
+            "SELECT value FROM watermarks WHERE key='在途票'"
+        ).fetchone()
+        stored_wm = wm_row["value"] if wm_row else 0
+        watermark_ok = stored_wm == in_flight
+
+        all_bad = mismatches + status_mismatches + residual_mismatches
         return {
-            "核对件数": len(rows),
+            "核对件数": len(item_rows),
             "不符件数": len(mismatches),
+            "票态不符": len(status_mismatches),
+            "关票残留": len(residual_mismatches),
+            "水位表缓存": stored_wm,
+            "在途重放": in_flight,
+            "水位一致": watermark_ok,
+            # 兼容旧字段名：守恒专指件数账。
             "守恒": not mismatches,
-            "明细": mismatches,
+            "对账一致": not all_bad and watermark_ok,
+            "明细": all_bad,
         }
     finally:
         conn.close()
-
-_pickup_impl = pickup
-
-
-def pickup(ticket_no: str, pickup_code: str, operator: str = "店员", **kwargs):
-    out = _pickup_impl(ticket_no, pickup_code, operator=operator, **kwargs) if 'pickup_code' in _pickup_impl.__code__.co_varnames else _pickup_impl(ticket_no, operator=operator, **kwargs)
-    return partial_surface.after_pickup(ticket_no, out)
 

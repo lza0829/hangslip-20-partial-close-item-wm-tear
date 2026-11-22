@@ -14,7 +14,7 @@ export default function Home() {
 
   const cells = d
     ? [
-        ["在途水位", d.surface_ok ? (d.在途水位 ?? d.在途 ?? "—") : d.在途水位],
+        ["在途水位", d.在途水位],
         ["待取", d.待取],
         ["部分已取", d.部分已取],
         ["残留件数", d.残留件数],

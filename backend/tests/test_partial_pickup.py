@@ -29,8 +29,12 @@ def client():
     import app.config as config
 
     config.DB_PATH = TMP / "test.db"
-    if config.DB_PATH.exists():
-        config.DB_PATH.unlink()
+    # WAL 模式下旧库还会留下 -wal/-shm 旁路文件，必须一并清掉，
+    # 否则上一个用例的残留行会让种子数据撞唯一约束。
+    for suffix in ("", "-wal", "-shm"):
+        side = TMP / f"test.db{suffix}"
+        if side.exists():
+            side.unlink()
     from fastapi.testclient import TestClient
 
     from app.main import app
@@ -278,3 +282,157 @@ def test_concurrent_partial_pickups_never_overdraw(client):
     assert after["remaining_qty"] == 0
     assert after["status"] == "已取"
     assert client.get("/api/核对/件数守恒").json()["守恒"] is True
+
+
+def test_multi_line_pickup_rolls_back_as_one_when_overdraw(client):
+    # 夹具「半截勾选件数不守恒」：一笔多件勾选里只要有一行超取，
+    # 整笔回滚——回执、核销行、件位、票态、水位全部原地不动。
+    open_ticket(client, "挂-ATOM", items=[{"garment": "衬衣", "qty": 2}, {"garment": "外套", "qty": 1}])
+    to_ready(client, "挂-ATOM")
+    detail = client.get("/api/挂牌/挂-ATOM").json()
+    shirt = next(i for i in detail["items"] if i["garment"] == "衬衣")
+    coat = next(i for i in detail["items"] if i["garment"] == "外套")
+    before_wm = wm(client)
+
+    r = client.post(
+        "/api/挂牌/挂-ATOM/取衣",
+        json={
+            "pickup_code": "暗码甲",
+            "items": [
+                {"item_id": shirt["id"], "qty": 2},
+                {"item_id": coat["id"], "qty": 5},  # 外套仅剩 1
+            ],
+        },
+    )
+    assert r.status_code == 409, r.text
+
+    after = detail_after(client, "挂-ATOM")
+    assert after["status"] == "待取"
+    assert after["picked_qty"] == 0
+    assert after["remaining_qty"] == 3
+    assert after["receipts"] == []
+    assert wm(client) == before_wm
+    audit = client.get("/api/核对/件数守恒").json()
+    assert audit["对账一致"] is True, audit
+
+
+def test_cross_surface_witness_after_partial_then_close(client):
+    # 取衣 API、勾选列表、待取墙、残留区、挂牌态（列表+详情）、水位总览互证。
+    open_ticket(client, "挂-WIT", items=[{"garment": "衬衣", "qty": 2}, {"garment": "外套", "qty": 1}])
+    to_ready(client, "挂-WIT")
+    detail = client.get("/api/挂牌/挂-WIT").json()
+    shirt = next(i for i in detail["items"] if i["garment"] == "衬衣")
+    before_wm = wm(client)
+
+    r = client.post(
+        "/api/挂牌/挂-WIT/取衣",
+        json={"pickup_code": "暗码甲", "items": [{"item_id": shirt["id"], "qty": 1}]},
+    )
+    assert r.status_code == 200
+
+    # 1) 详情与列表页件数账一致。
+    detail = detail_after(client, "挂-WIT")
+    listed = next(t for t in client.get("/api/挂牌").json() if t["ticket_no"] == "挂-WIT")
+    for view in (detail, listed):
+        assert view["status"] == "部分已取"
+        assert view["picked_qty"] == 1
+        assert view["remaining_qty"] == 2
+        assert view["closed_at"] is None
+
+    # 2) 待取墙仍挂着该票，残留件口径与详情相同。
+    ready = next(t for t in client.get("/api/待取").json() if t["ticket_no"] == "挂-WIT")
+    assert sum(i["remaining"] for i in ready["remaining_items"]) == 2
+
+    # 3) 残留区能核到两件未取，且票态不是关票态。
+    residual_rows = [x for x in residual(client) if x["ticket_no"] == "挂-WIT"]
+    assert sum(x["remaining"] for x in residual_rows) == 2
+    assert all(x["ticket_status"] == "部分已取" for x in residual_rows)
+
+    # 4) 部分取件水位绝不整减，且水位表与票态重放一致（不假绿）。
+    dash = client.get("/api/总览").json()
+    assert dash["在途水位"] == before_wm
+    assert dash["水位一致"] is True
+    assert dash["部分已取"] >= 1
+
+    # 5) 取齐最后一件：关票、出途、水位减一、待取墙与残留区同时撤下。
+    r = client.post("/api/挂牌/挂-WIT/取衣", json={"pickup_code": "暗码甲"})
+    assert r.status_code == 200 and r.json()["status"] == "已取"
+    assert wm(client) == before_wm - 1
+    assert all(t["ticket_no"] != "挂-WIT" for t in client.get("/api/待取").json())
+    assert [x for x in residual(client) if x["ticket_no"] == "挂-WIT"] == []
+    closed = detail_after(client, "挂-WIT")
+    assert closed["closed_at"] is not None and closed["remaining_qty"] == 0
+    # 已关票不可再核销，守住件数上界。
+    r = client.post("/api/挂牌/挂-WIT/取衣", json={"pickup_code": "暗码甲"})
+    assert r.status_code == 409
+    assert client.get("/api/核对/件数守恒").json()["对账一致"] is True
+
+
+def test_poisoned_fake_partial_is_healed_from_item_bitmap(client):
+    # 夹具「整票关仍有未勾件」：模拟旧假分取旁路制造的撕裂库——
+    # 票态刷成已取、水位减一、写假绿缓存，但件位不动。重开库后必须
+    # 按勾选位图收口，且收口后票能继续取件直到真关票。
+    import app.db as dbmod
+
+    open_ticket(client, "挂-HEAL1", items=[{"garment": "衬衣", "qty": 2}])
+    to_ready(client, "挂-HEAL1")
+    detail = client.get("/api/挂牌/挂-HEAL1").json()
+    shirt = detail["items"][0]
+    client.post(
+        "/api/挂牌/挂-HEAL1/取衣",
+        json={"pickup_code": "暗码甲", "items": [{"item_id": shirt["id"], "qty": 1}]},
+    )
+    # 一张一件未取的票，也被毒成已取。
+    open_ticket(client, "挂-HEAL2", items=[{"garment": "大衣", "qty": 1}])
+    to_ready(client, "挂-HEAL2")
+
+    poisoned_at = "2026-01-01 09:00:00"
+    conn = dbmod.connect()
+    try:
+        conn.execute(
+            "UPDATE hang_tickets SET status='已取', closed_at=? WHERE ticket_no IN (?,?)",
+            (poisoned_at, "挂-HEAL1", "挂-HEAL2"),
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES ('partial_surface_ok', '1')"
+        )
+        # 假分取把水位无条件减一，与真实在途票数脱节。
+        conn.execute("UPDATE watermarks SET value = MAX(value - 1, 0) WHERE key='在途票'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 重新迁移即收口。
+    dbmod.init_db()
+
+    h1 = detail_after(client, "挂-HEAL1")
+    assert h1["status"] == "部分已取"  # 有已取件、仍有残留
+    assert h1["closed_at"] is None
+    assert h1["picked_qty"] == 1 and h1["remaining_qty"] == 1
+    h2 = detail_after(client, "挂-HEAL2")
+    assert h2["status"] == "待取"        # 一件未取，回到待取
+    assert h2["picked_qty"] == 0 and h2["remaining_qty"] == 1
+
+    # 假绿缓存清掉；水位按票态重放复位；残留区可核；对账全绿。
+    settings = client.get("/api/设置").json()
+    assert not any(k.startswith("partial_surface") for k in settings)
+    dash = client.get("/api/总览").json()
+    assert dash["水位一致"] is True
+    # 默认残留视图列出已开始取件的 HEAL1（1 件）；
+    # 全量在册视图含尚未开始取件的 HEAL2，两件残留都可核。
+    partial_residual = [x for x in residual(client) if x["ticket_no"] in ("挂-HEAL1", "挂-HEAL2")]
+    assert sum(x["remaining"] for x in partial_residual) == 1
+    full_residual = client.get("/api/残留?include_in_process=true").json()
+    healed_residual = [x for x in full_residual if x["ticket_no"] in ("挂-HEAL1", "挂-HEAL2")]
+    assert sum(x["remaining"] for x in healed_residual) == 2
+    assert all(x["ticket_status"] != "已取" for x in healed_residual)
+    audit = client.get("/api/核对/件数守恒").json()
+    assert audit["对账一致"] is True, audit
+    assert audit["票态不符"] == 0 and audit["关票残留"] == 0
+
+    # 收口不是化妆：两张票都能凭暗码继续核销直至真关票。
+    r = client.post("/api/挂牌/挂-HEAL1/取衣", json={"pickup_code": "暗码甲"})
+    assert r.status_code == 200 and r.json()["status"] == "已取"
+    r = client.post("/api/挂牌/挂-HEAL2/取衣", json={"pickup_code": "暗码甲"})
+    assert r.status_code == 200 and r.json()["status"] == "已取"
+    assert client.get("/api/核对/件数守恒").json()["对账一致"] is True

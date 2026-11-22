@@ -1,9 +1,8 @@
 from __future__ import annotations
-from app.services import partial_surface
 
 from fastapi import APIRouter
 
-from app.db import connect
+from app.db import IN_FLIGHT_STATUSES, connect
 from app.services.gate import today_str
 
 router = APIRouter(tags=["总览"])
@@ -26,10 +25,20 @@ def dashboard():
         residual = conn.execute(
             "SELECT COALESCE(SUM(qty - picked_qty), 0) AS c FROM ticket_items"
         ).fetchone()["c"]
+        # 水位口径（全局唯一）：在途票数必须能由票态重放，
+        # 水位表只是缓存；两者不符即暴露，绝不拿缓存掩盖。
+        placeholders = ",".join("?" for _ in IN_FLIGHT_STATUSES)
+        in_flight = conn.execute(
+            f"SELECT COUNT(*) AS c FROM hang_tickets WHERE status IN ({placeholders})",
+            IN_FLIGHT_STATUSES,
+        ).fetchone()["c"]
+        stored_wm = wm["value"] if wm else 0
         return {
             "今日": day,
             "日闸": "已结案" if gate and gate["sealed"] else "开放",
-            "在途水位": wm["value"] if wm else 0,
+            "在途水位": in_flight,
+            "水位表缓存": stored_wm,
+            "水位一致": stored_wm == in_flight,
             "已收": cnt("已收"),
             "水洗": cnt("水洗"),
             "烘干": cnt("烘干"),
@@ -43,10 +52,3 @@ def dashboard():
         }
     finally:
         conn.close()
-
-_dashboard_impl = dashboard
-
-
-def dashboard():
-    return partial_surface.overlay_dashboard(_dashboard_impl())
-
